@@ -582,146 +582,353 @@ fn_setup_ufw() {
 }
 
 # =============================================================================
-# ЗАГЛУШКА — NGINX FALLBACK (страница "сайт на тех. работах")
+# FAIL2BAN — ЗАЩИТА ОТ БРУТФОРСА (вспомогательные функции)
 # =============================================================================
-fn_setup_stub() {
-    sep; echo -e "${BOLD}🎭 Установка страницы-заглушки (Nginx fallback)${RESET}"; sep
 
-    check_docker
+F2B_CONF="/etc/fail2ban/jail.local"   # конфиг с нашими настройками
 
-    STUB_DIR="/opt/remnanode-stub"
+# Читаем текущее значение параметра из jail.local
+_f2b_get() { grep "^${1}" "$F2B_CONF" 2>/dev/null | head -1 | awk '{print $3}'; }
+
+# Форматируем секунды в человекочитаемый вид
+_f2b_fmt() {
+    local s=$1
+    [[ ! "$s" =~ ^[0-9]+$ ]] && { echo "$s"; return; }
+    (( s >= 86400 )) && { echo "$((s/86400))д $((s%86400/3600))ч"; return; }
+    (( s >= 3600  )) && { echo "$((s/3600))ч $((s%3600/60))м";     return; }
+    (( s >= 60    )) && { echo "$((s/60))м $((s%60))с";            return; }
+    echo "${s}с"
+}
+
+# Записываем jail.local с текущими значениями переменных
+_f2b_write_conf() {
+    local bt=${1:-$(_f2b_get bantime)};  bt=${bt:-3600}
+    local mr=${2:-$(_f2b_get maxretry)}; mr=${mr:-5}
+    local ft=${3:-$(_f2b_get findtime)}; ft=${ft:-600}
+    cat > "$F2B_CONF" <<EOF
+# Конфиг Fail2Ban — создан rw-install скриптом
+[DEFAULT]
+bantime  = ${bt}
+maxretry = ${mr}
+findtime = ${ft}
+backend  = auto
+
+[sshd]
+enabled  = true
+port     = ssh
+filter   = sshd
+logpath  = /var/log/auth.log
+maxretry = ${mr}
+EOF
+    ok "Конфиг записан: ${F2B_CONF}"
+}
+
+# Перезапускаем если запущен
+_f2b_apply() {
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        systemctl reload-or-restart fail2ban 2>/dev/null
+        ok "Fail2Ban перезапущен с новыми настройками"
+    fi
+}
+
+# --- Установка ---
+_f2b_install() {
+    sep; echo -e "${BOLD}📦 Установка Fail2Ban${RESET}"; sep
+    info "Обновляем пакеты и устанавливаем fail2ban..."
+    apt-get update -qq
+    apt-get install -y fail2ban >/dev/null 2>&1
+    if ! command -v fail2ban-client &>/dev/null; then
+        err "Ошибка установки fail2ban!"; return 1
+    fi
+    ok "Fail2Ban установлен"
+
+    # Сохраняем текущие значения если конфиг уже есть, иначе дефолтные
+    local bt=$(_f2b_get bantime);  bt=${bt:-3600}
+    local mr=$(_f2b_get maxretry); mr=${mr:-5}
+    local ft=$(_f2b_get findtime); ft=${ft:-600}
+    _f2b_write_conf "$bt" "$mr" "$ft"
+
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban
+    ok "Fail2Ban запущен и добавлен в автозапуск"
+    echo ""
+    info "Активный jail — sshd (защита SSH от брутфорса)"
+    info "Текущие настройки: bantime=${bt}с, maxretry=${mr}, findtime=${ft}с"
+}
+
+# --- Изменить время бана ---
+_f2b_set_bantime() {
+    local cur=$(_f2b_get bantime); cur=${cur:-3600}
+    echo ""
+    echo -e "  ${BOLD}⏱️  Время бана (bantime)${RESET}"
+    echo -e "  Текущее: ${YELLOW}${cur}с${RESET} ($(_f2b_fmt $cur))"
+    echo -e "  Сколько секунд IP остаётся заблокированным."
+    echo -e "  ${BLUE}Примеры: 600 (10мин), 3600 (1ч), 86400 (1день)${RESET}"
+    echo ""
+    read -rp "  Введи bantime в секундах [Enter = оставить ${cur}]: " val
+    [[ -z "$val" ]] && { info "Без изменений."; return; }
+    if [[ ! "$val" =~ ^[0-9]+$ ]]; then warn "Только цифры!"; return; fi
+    _f2b_write_conf "$val" "$(_f2b_get maxretry)" "$(_f2b_get findtime)"
+    _f2b_apply
+    ok "bantime = ${val}с ($(_f2b_fmt $val))"
+}
+
+# --- Изменить кол-во попыток ---
+_f2b_set_maxretry() {
+    local cur=$(_f2b_get maxretry); cur=${cur:-5}
+    echo ""
+    echo -e "  ${BOLD}🔢 Попыток до бана (maxretry)${RESET}"
+    echo -e "  Текущее: ${YELLOW}${cur}${RESET}"
+    echo -e "  Сколько неудачных попыток входа разрешено за findtime."
+    echo -e "  ${BLUE}Примеры: 3 (строго), 5 (стандарт), 10 (мягко)${RESET}"
+    echo ""
+    read -rp "  Введи maxretry [Enter = оставить ${cur}]: " val
+    [[ -z "$val" ]] && { info "Без изменений."; return; }
+    if [[ ! "$val" =~ ^[0-9]+$ ]]; then warn "Только цифры!"; return; fi
+    _f2b_write_conf "$(_f2b_get bantime)" "$val" "$(_f2b_get findtime)"
+    _f2b_apply
+    ok "maxretry = ${val}"
+}
+
+# --- Изменить окно поиска ---
+_f2b_set_findtime() {
+    local cur=$(_f2b_get findtime); cur=${cur:-600}
+    echo ""
+    echo -e "  ${BOLD}🔍 Окно поиска (findtime)${RESET}"
+    echo -e "  Текущее: ${YELLOW}${cur}с${RESET} ($(_f2b_fmt $cur))"
+    echo -e "  За какой период считаются неудачные попытки."
+    echo -e "  ${BLUE}Примеры: 300 (5мин), 600 (10мин), 1800 (30мин)${RESET}"
+    echo ""
+    read -rp "  Введи findtime в секундах [Enter = оставить ${cur}]: " val
+    [[ -z "$val" ]] && { info "Без изменений."; return; }
+    if [[ ! "$val" =~ ^[0-9]+$ ]]; then warn "Только цифры!"; return; fi
+    _f2b_write_conf "$(_f2b_get bantime)" "$(_f2b_get maxretry)" "$val"
+    _f2b_apply
+    ok "findtime = ${val}с ($(_f2b_fmt $val))"
+}
+
+# --- Статус и заблокированные IP ---
+_f2b_status() {
+    sep; echo -e "${BOLD}📊 Статус Fail2Ban${RESET}"; sep
+    if ! command -v fail2ban-client &>/dev/null; then
+        err "Fail2Ban не установлен (пункт 1)"; return
+    fi
+    echo ""
+    fail2ban-client status
+    echo ""
+    sep
+    echo -e "${BOLD}  Детали jail sshd:${RESET}"
+    sep
+    fail2ban-client status sshd 2>/dev/null || warn "Jail sshd не активен"
+}
+
+# --- Удалить fail2ban ---
+_f2b_remove() {
+    echo ""
+    warn "Это остановит и полностью удалит Fail2Ban!"
+    read -rp "  Удалить fail2ban? [y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || { info "Отменено."; return; }
+    systemctl stop fail2ban 2>/dev/null || true
+    systemctl disable fail2ban 2>/dev/null || true
+    apt-get remove -y --purge fail2ban >/dev/null 2>&1
+    rm -f "$F2B_CONF"
+    ok "Fail2Ban удалён"
+}
+
+# --- Главная функция подменю Fail2Ban ---
+fn_fail2ban() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}${BOLD}  ╔═════════════════════════════════════════╗${RESET}"
+        echo -e "${CYAN}${BOLD}  ║   🛡️  Fail2Ban — Защита от брутфорса   ║${RESET}"
+        echo -e "${CYAN}${BOLD}  ╚═════════════════════════════════════════╝${RESET}"
+        echo ""
+
+        # Показываем текущий статус и настройки
+        if command -v fail2ban-client &>/dev/null && systemctl is-active --quiet fail2ban 2>/dev/null; then
+            local jails
+            jails=$(fail2ban-client status 2>/dev/null | grep "Number of jail" | awk '{print $NF}')
+            ok "Fail2Ban запущен | Jail-ов активно: ${jails:-?}"
+        elif command -v fail2ban-client &>/dev/null; then
+            warn "Fail2Ban установлен, но не запущен"
+        else
+            warn "Fail2Ban не установлен"
+        fi
+
+        # Текущие значения из конфига
+        local bt mr ft
+        bt=$(_f2b_get bantime);  bt=${bt:-—}
+        mr=$(_f2b_get maxretry); mr=${mr:-—}
+        ft=$(_f2b_get findtime); ft=${ft:-—}
+
+        echo ""
+        echo -e "  ${BLUE}bantime:${RESET}  ${YELLOW}${bt}${RESET}$([ "$bt" != "—" ] && echo " ($(_f2b_fmt $bt))" || true)"
+        echo -e "  ${BLUE}maxretry:${RESET} ${YELLOW}${mr}${RESET}"
+        echo -e "  ${BLUE}findtime:${RESET} ${YELLOW}${ft}${RESET}$([ "$ft" != "—" ] && echo " ($(_f2b_fmt $ft))" || true)"
+        echo ""
+        sep
+        echo -e "  ${GREEN}1)${RESET} 📦 Установить / переустановить Fail2Ban"
+        echo -e "  ${GREEN}2)${RESET} ⏱️  Время бана           ${CYAN}(bantime)${RESET}"
+        echo -e "  ${GREEN}3)${RESET} 🔢 Попыток до бана      ${CYAN}(maxretry)${RESET}"
+        echo -e "  ${GREEN}4)${RESET} 🔍 Окно поиска          ${CYAN}(findtime)${RESET}"
+        echo -e "  ${GREEN}5)${RESET} 📊 Статус и заблокированные IP"
+        echo -e "  ${RED}6)${RESET} 🗑️  Удалить Fail2Ban"
+        sep
+        echo -e "  ${YELLOW} 0)${RESET} ← Назад в главное меню"
+        echo ""
+
+        read -rp "  Выбери пункт [0-6]: " f2b_choice
+        echo ""
+
+        case "$f2b_choice" in
+            1) _f2b_install    ;;
+            2) _f2b_set_bantime  ;;
+            3) _f2b_set_maxretry ;;
+            4) _f2b_set_findtime ;;
+            5) _f2b_status     ;;
+            6) _f2b_remove     ;;
+            0) return          ;;
+            *) warn "Неверный выбор '$f2b_choice'. Введи 0-6." ;;
+        esac
+
+        echo ""
+        read -rp "  Нажми Enter для продолжения..." _
+    done
+}
+
+
+
+
+# =============================================================================
+# УДАЛЕНИЕ — СКРИПТ И ВСЁ УСТАНОВЛЕННОЕ
+# =============================================================================
+fn_uninstall() {
+    sep; echo -e "${BOLD}🗑️  Удаление RemnaNode Installer${RESET}"; sep
 
     echo ""
-    echo -e "  ${CYAN}Как это работает:${RESET}"
-    echo -e "  • Nginx запускается на локальном порту (например, 8080)"
-    echo -e "  • В панели Remnawave (Xray Inbound) добавляется fallback"
-    echo -e "  • Если обычный браузер зайдёт на 443 — получит страницу-заглушку"
-    echo -e "  • VPN-клиенты при этом продолжают работать как обычно"
+    warn "Каждый компонент будет спрошен отдельно — ничего не удалится без подтверждения."
     echo ""
 
-    # Запрашиваем порт для nginx
-    read -rp "  Порт для заглушки [по умолчанию 8080]: " STUB_PORT
-    [[ -z "$STUB_PORT" || ! "$STUB_PORT" =~ ^[0-9]+$ ]] && STUB_PORT="8080"
+    RM_NODE=false; RM_CERTBOT=false; RM_F2B=false
+    RM_CRON=false; RM_UFW=false;    RM_ALIAS=false
 
-    # Запрашиваем название сайта и текст сообщения
+    # --- 1. RemnaNode ---
+    if [[ -f "${REMNANODE_DIR}/docker-compose.yml" ]] || \
+       docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^remnanode$"; then
+        echo -e "  ${CYAN}[Нода]${RESET} Найдена нода в ${REMNANODE_DIR}"
+        read -rp "  Остановить контейнер и удалить ${REMNANODE_DIR}? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_NODE=true
+    fi
+
+    # --- 2. Certbot + сертификаты ---
+    if [[ -d "${CERTBOT_DIR}" ]]; then
+        echo ""
+        echo -e "  ${CYAN}[SSL]${RESET} Найден Certbot в ${CERTBOT_DIR}"
+        read -rp "  Удалить сертификаты и директорию ${CERTBOT_DIR}? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_CERTBOT=true
+    fi
+
+    # --- 3. Fail2Ban ---
+    if command -v fail2ban-client &>/dev/null; then
+        echo ""
+        echo -e "  ${CYAN}[Fail2Ban]${RESET} Найден fail2ban"
+        read -rp "  Удалить fail2ban? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_F2B=true
+    fi
+
+    # --- 4. Cron-задача для certbot ---
+    if crontab -l 2>/dev/null | grep -q "certbot renew"; then
+        echo ""
+        echo -e "  ${CYAN}[Cron]${RESET} Найдена задача автообновления сертификата"
+        read -rp "  Удалить cron-задачу certbot renew? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_CRON=true
+    fi
+
+    # --- 5. Правила UFW ---
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "443"; then
+        echo ""
+        echo -e "  ${CYAN}[UFW]${RESET} Найдены правила UFW для порта 443"
+        read -rp "  Удалить правила UFW для 443 (и порта ноды)? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_UFW=true
+    fi
+
+    # --- 6. Алиас rw-install ---
     echo ""
-    read -rp "  Название сайта (например: MyService): " SITE_NAME
-    [[ -z "$SITE_NAME" ]] && SITE_NAME="Сервис"
+    echo -e "  ${CYAN}[Алиас]${RESET} Команда /usr/local/bin/rw-install"
+    read -rp "  Удалить команду rw-install? [y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] && RM_ALIAS=true
 
-    echo ""
-    read -rp "  Текст сообщения для посетителей: " STUB_MSG
-    [[ -z "$STUB_MSG" ]] && STUB_MSG="Ведутся технические работы. Вернитесь позже."
+    # Итоговое подтверждение
+    echo ""; sep
+    echo -e "  ${BOLD}Итоговый список действий:${RESET}"
+    [[ "$RM_NODE"    == true ]] && echo -e "  ${RED}✗${RESET} Остановить и удалить RemnaNode (${REMNANODE_DIR})"
+    [[ "$RM_CERTBOT" == true ]] && echo -e "  ${RED}✗${RESET} Удалить Certbot + сертификаты (${CERTBOT_DIR})"
+    [[ "$RM_F2B"     == true ]] && echo -e "  ${RED}✗${RESET} Удалить Fail2Ban"
+    [[ "$RM_CRON"    == true ]] && echo -e "  ${RED}✗${RESET} Удалить cron-задачу certbot"
+    [[ "$RM_UFW"     == true ]] && echo -e "  ${RED}✗${RESET} Удалить правила UFW для 443"
+    [[ "$RM_ALIAS"   == true ]] && echo -e "  ${RED}✗${RESET} Удалить команду rw-install"
 
-    # Создаём рабочую директорию
-    mkdir -p "${STUB_DIR}/html"
+    if [[ "$RM_NODE$RM_CERTBOT$RM_F2B$RM_CRON$RM_UFW$RM_ALIAS" == *"true"* ]]; then
+        echo ""
+        read -rp "  Всё верно? Запустить удаление? [y/N]: " final
+        [[ "$final" =~ ^[Yy]$ ]] || { info "Отменено. Ничего не удалено."; return; }
+    else
+        info "Ничего не выбрано. Выход."; return
+    fi
 
-    # Генерируем HTML страницу-заглушку (минималистичный тёмный дизайн)
-    info "Создаём страницу-заглушку..."
-    cat > "${STUB_DIR}/html/index.html" <<HTMLEOF
-<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${SITE_NAME}</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0a0a;
-            color: #e0e0e0;
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .card {
-            text-align: center;
-            padding: 3rem 2rem;
-            max-width: 480px;
-            background: #111;
-            border: 1px solid #1f1f1f;
-            border-radius: 16px;
-        }
-        .icon { font-size: 3.5rem; margin-bottom: 1.5rem; }
-        h1 { font-size: 1.6rem; font-weight: 600; color: #fff; margin-bottom: 0.75rem; }
-        p { font-size: 0.95rem; color: #666; line-height: 1.7; }
-        .badge {
-            display: inline-flex; align-items: center; gap: 8px;
-            background: #1a1a1a; border: 1px solid #2a2a2a;
-            padding: 0.4rem 1rem; border-radius: 999px;
-            font-size: 0.8rem; color: #888; margin-bottom: 1.5rem;
-        }
-        .dot {
-            width: 7px; height: 7px; border-radius: 50%;
-            background: #ff4444;
-            animation: pulse 2s ease-in-out infinite;
-        }
-        @keyframes pulse {
-            0%, 100% { opacity: 1; transform: scale(1); }
-            50% { opacity: 0.4; transform: scale(0.85); }
-        }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <div class="icon">🔧</div>
-        <div class="badge"><span class="dot"></span>Временно недоступно</div>
-        <h1>${SITE_NAME}</h1>
-        <p>${STUB_MSG}</p>
-    </div>
-</body>
-</html>
-HTMLEOF
+    sep; echo ""
 
-    # Создаём Nginx конфиг (слушает на STUB_PORT, отдаёт HTML)
-    info "Создаём конфиг Nginx..."
-    cat > "${STUB_DIR}/nginx.conf" <<EOF
-server {
-    listen ${STUB_PORT};
-    root /usr/share/nginx/html;
-    index index.html;
-    server_tokens off;
-    location / {
-        try_files \$uri \$uri/ /index.html;
+    [[ "$RM_NODE" == true ]] && {
+        info "Останавливаем и удаляем RemnaNode..."
+        docker compose -f "${REMNANODE_DIR}/docker-compose.yml" down 2>/dev/null || true
+        docker rm -f remnanode 2>/dev/null || true
+        rm -rf "${REMNANODE_DIR}"
+        ok "RemnaNode удалена"
     }
-}
-EOF
+    [[ "$RM_CERTBOT" == true ]] && {
+        info "Удаляем Certbot и сертификаты..."
+        docker compose -f "${CERTBOT_DIR}/docker-compose.yml" down 2>/dev/null || true
+        docker rm -f certbot 2>/dev/null || true
+        rm -rf "${CERTBOT_DIR}"
+        ok "Certbot и сертификаты удалены"
+    }
+    [[ "$RM_F2B" == true ]] && {
+        info "Удаляем Fail2Ban..."
+        _f2b_remove 2>/dev/null || {
+            systemctl stop fail2ban 2>/dev/null; systemctl disable fail2ban 2>/dev/null
+            apt-get remove -y --purge fail2ban >/dev/null 2>&1
+        }
+        ok "Fail2Ban удалён"
+    }
+    [[ "$RM_CRON" == true ]] && {
+        info "Удаляем cron-задачу certbot..."
+        ( crontab -l 2>/dev/null | grep -v "certbot renew" ) | crontab -
+        ok "Cron-задача удалена"
+    }
+    [[ "$RM_UFW" == true ]] && {
+        info "Удаляем правила UFW для 443..."
+        ufw delete allow 443     2>/dev/null || true
+        ufw delete allow 443/tcp 2>/dev/null || true
+        ufw delete allow 443/udp 2>/dev/null || true
+        NODE_PORT_RM=$(grep "NODE_PORT=" "${REMNANODE_DIR}/docker-compose.yml" 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')
+        [[ -n "$NODE_PORT_RM" ]] && ufw delete allow "${NODE_PORT_RM}/tcp" 2>/dev/null || true
+        ok "Правила UFW для 443 удалены"
+        info "SSH и другие правила НЕ тронуты"
+    }
+    [[ "$RM_ALIAS" == true ]] && {
+        info "Удаляем команду rw-install..."
+        rm -f "/usr/local/bin/rw-install"
+        ok "Команда rw-install удалена"
+    }
 
-    # Docker Compose для заглушки (образ nginx:alpine — лёгкий)
-    cat > "${STUB_DIR}/docker-compose.yml" <<EOF
-services:
-  remnanode-stub:
-    container_name: remnanode-stub
-    image: nginx:alpine
-    network_mode: host
-    restart: always
-    volumes:
-      - ./html:/usr/share/nginx/html:ro
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-EOF
-
-    # Запускаем заглушку
-    info "Запуск заглушки на порту ${STUB_PORT}..."
-    docker compose -f "${STUB_DIR}/docker-compose.yml" up -d
-
-    ok "Заглушка запущена на порту ${STUB_PORT}!"
+    sep; ok "Удаление завершено!"
     echo ""
+    info "Docker-образы НЕ удалялись. Очистить: docker image prune -a"
     sep
-    echo -e "  ${BOLD}📌 Следующие шаги для подключения fallback в Xray:${RESET}"
-    echo ""
-    echo -e "  ${CYAN}1.${RESET} Зайди в панель Remnawave → Ноды → Xray Inbound (443)"
-    echo -e "  ${CYAN}2.${RESET} Добавь в конфиг fallback (секция fallbacks):"
-    echo ""
-    echo -e "     ${YELLOW}{\"dest\": \"${STUB_PORT}\", \"xver\": 0}${RESET}"
-    echo ""
-    echo -e "  ${CYAN}3.${RESET} Открой порт в ufw: ${YELLOW}ufw allow ${STUB_PORT}/tcp${RESET}"
-    echo -e "  ${CYAN}4.${RESET} Сохрани и примени конфиг в панели"
-    echo ""
-    echo -e "  ${BLUE}ℹ️  Файлы заглушки: ${STUB_DIR}/${RESET}"
-    echo -e "  ${BLUE}ℹ️  HTML страница: ${STUB_DIR}/html/index.html${RESET}"
-    sep
 }
+
+
 
 # =============================================================================
 # ГЛАВНОЕ МЕНЮ
@@ -751,9 +958,9 @@ main_menu() {
             echo -e "  ${GREEN}🔒 SSL: ${CERT_DOMAIN:-активен}${RESET}"
         fi
 
-        # Показываем статус заглушки если установлена
-        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^remnanode-stub$"; then
-            echo -e "  ${GREEN}🎭 Заглушка: запущена${RESET}"
+        # Показываем статус fail2ban если установлен
+        if command -v fail2ban-client &>/dev/null && systemctl is-active --quiet fail2ban 2>/dev/null; then
+            echo -e "  ${GREEN}🛡️  Fail2Ban: активен${RESET}"
         fi
 
         echo ""
@@ -771,15 +978,18 @@ main_menu() {
         echo ""
         echo -e "  ${BOLD}Безопасность и защита:${RESET}"
         echo -e "  ${GREEN} 8)${RESET} 🔥 Настроить UFW ${YELLOW}(фаервол: SSH + 443 + порт ноды)${RESET}"
-        echo -e "  ${GREEN} 9)${RESET} 🎭 Установить заглушку ${YELLOW}(Nginx fallback на 443)${RESET}"
+        echo -e "  ${GREEN} 9)${RESET} 🛡️  Fail2Ban ${YELLOW}(защита от брутфорса → подменю)${RESET}"
         echo ""
         echo -e "  ${BOLD}Утилиты:${RESET}"
         echo -e "  ${GREEN}10)${RESET} 📥 Установить команду ${CYAN}rw-install${RESET} ${YELLOW}(запуск из любого места)${RESET}"
+        echo ""
+        echo -e "  ${BOLD}Удаление:${RESET}"
+        echo -e "  ${RED}11)${RESET} 🗑️  Удалить скрипт и компоненты ${YELLOW}(с выбором что удалять)${RESET}"
         sep
         echo -e "  ${RED} 0)${RESET} ❌ Выход"
         echo ""
 
-        read -rp "  Выбери пункт [0-10]: " choice
+        read -rp "  Выбери пункт [0-11]: " choice
         echo ""
 
         case "$choice" in
@@ -791,13 +1001,14 @@ main_menu() {
             6)  fn_stop               ;;
             7)  fn_start              ;;
             8)  fn_setup_ufw          ;;
-            9)  fn_setup_stub         ;;
+            9)  fn_fail2ban           ;;
             10) fn_install_alias      ;;
+            11) fn_uninstall          ;;
             0)
                 echo -e "${GREEN}Удачи! 👋${RESET}"
                 exit 0 ;;
             *)
-                warn "Неверный выбор: '$choice'. Введи 0-10." ;;
+                warn "Неверный выбор: '$choice'. Введи 0-11." ;;
         esac
 
         echo ""
