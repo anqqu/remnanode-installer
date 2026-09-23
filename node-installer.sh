@@ -522,16 +522,20 @@ fn_setup_ufw() {
         ok "ufw установлен"
     fi
 
-    # Читаем NODE_PORT из docker-compose ноды если есть
+    # Авто-определяем NODE_PORT из docker-compose.yml ноды
     NODE_PORT_CURRENT=""
     if [[ -f "${REMNANODE_DIR}/docker-compose.yml" ]]; then
         NODE_PORT_CURRENT=$(grep "NODE_PORT=" "${REMNANODE_DIR}/docker-compose.yml" | cut -d= -f2 | tr -d '[:space:]')
     fi
 
-    # Читаем порт заглушки если установлена
-    STUB_PORT_CURRENT=""
-    if [[ -f "/opt/remnanode-stub/nginx.conf" ]]; then
-        STUB_PORT_CURRENT=$(grep "listen" "/opt/remnanode-stub/nginx.conf" 2>/dev/null | awk '{print $2}' | tr -d ';')
+    if [[ -n "$NODE_PORT_CURRENT" ]]; then
+        ok "Найден порт ноды: ${NODE_PORT_CURRENT} (из ${REMNANODE_DIR}/docker-compose.yml)"
+    else
+        warn "Нода не найдена — порт будет введён вручную."
+        echo ""
+        read -rp "  Введи порт ноды из панели Remnawave (или Enter чтобы пропустить): " NODE_PORT_CURRENT
+        # Если ввели не число — обнуляем
+        [[ ! "$NODE_PORT_CURRENT" =~ ^[0-9]+$ ]] && NODE_PORT_CURRENT=""
     fi
 
     echo ""
@@ -558,8 +562,6 @@ fn_setup_ufw() {
     echo -e "  ${GREEN}✓${RESET} ufw allow ${UFW_443}"
     [[ -n "$NODE_PORT_CURRENT" ]] && \
         echo -e "  ${GREEN}✓${RESET} ufw allow ${NODE_PORT_CURRENT}/tcp ${YELLOW}(порт ноды из панели)${RESET}"
-    [[ -n "$STUB_PORT_CURRENT" ]] && \
-        echo -e "  ${GREEN}✓${RESET} ufw allow ${STUB_PORT_CURRENT}/tcp ${YELLOW}(порт заглушки)${RESET}"
     echo -e "  ${GREEN}✓${RESET} ufw enable"
     sep
     echo ""
@@ -571,7 +573,6 @@ fn_setup_ufw() {
     ufw allow OpenSSH
     ufw allow "$UFW_443"
     [[ -n "$NODE_PORT_CURRENT" ]] && ufw allow "${NODE_PORT_CURRENT}/tcp"
-    [[ -n "$STUB_PORT_CURRENT" ]] && ufw allow "${STUB_PORT_CURRENT}/tcp"
 
     # Включаем ufw (echo y — автоматическое подтверждение)
     echo "y" | ufw enable
@@ -735,6 +736,284 @@ _f2b_remove() {
     ok "Fail2Ban удалён"
 }
 
+# --- Защита от сканеров (ГРФЦ / РКН) ---
+# Файл со списком заблокированных диапазонов
+_SCANNER_LIST="/etc/remnanode-scanners.list"
+
+# Встроенный стартовый список известных IP-диапазонов ГРФЦ/сканеров РКН
+# Источники: задокументированы community-проектами (antifilter, amnezia-vpn, 2ip.ru и др.)
+# Список можно дополнять вручную через пункт "Добавить свой диапазон"
+_SCANNER_BUILTIN=(
+    "45.136.205.0/24    # ГРФЦ — зафиксированы в community-базах как сканеры ТСПУ"
+    "45.143.220.0/22    # ГРФЦ — активное зондирование VPN-портов"
+    "185.117.82.0/23    # РКН-инфраструктура — сканирование 443/tcp"
+    "185.234.218.0/24   # Известный сканер VPN-сервисов"
+    "193.233.192.0/22   # Сканеры, ассоциированные с ТСПУ Ростелеком"
+    "46.188.0.0/18      # Ростелеком ТСПУ — диапазон зондирования"
+)
+
+# Применяем UFW-блокировки для всех IP из файла списка
+_scanner_apply_ufw() {
+    if [[ ! -f "$_SCANNER_LIST" ]]; then return; fi
+    local count=0
+    while IFS= read -r line; do
+        # Пропускаем пустые строки и комментарии
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        local cidr; cidr=$(echo "$line" | awk '{print $1}')
+        [[ -z "$cidr" ]] && continue
+        # Добавляем правило только если его ещё нет
+        if ! ufw status 2>/dev/null | grep -q "$cidr"; then
+            ufw insert 1 deny from "$cidr" to any >/dev/null 2>&1
+            (( count++ ))
+        fi
+    done < "$_SCANNER_LIST"
+    [[ $count -gt 0 ]] && ok "Применено новых UFW-правил: ${count}"
+}
+
+# --- Главная функция подменю анти-сканер ---
+_f2b_scanner() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${CYAN}${BOLD}  ╔═════════════════════════════════════════╗${RESET}"
+        echo -e "${CYAN}${BOLD}  ║   🤖 Защита от сканеров (ГРФЦ / РКН)   ║${RESET}"
+        echo -e "${CYAN}${BOLD}  ╚═════════════════════════════════════════╝${RESET}"
+        echo ""
+
+        # Пояснение
+        echo -e "  ${BLUE}Как это работает:${RESET}"
+        echo -e "  • Блокировка известных IP ГРФЦ и сканеров РКН на уровне UFW"
+        echo -e "  • Ограничение частоты новых подключений к порту 443"
+        echo -e "  ${YELLOW}ℹ️  Reality уже камуфлирует трафик, но IP-блокировка — доп. слой${RESET}"
+        echo ""
+
+        # Статус: количество заблокированных диапазонов
+        local blocked_count=0
+        [[ -f "$_SCANNER_LIST" ]] && blocked_count=$(grep -vc '^\s*#\|^\s*$' "$_SCANNER_LIST" 2>/dev/null || echo 0)
+        if [[ $blocked_count -gt 0 ]]; then
+            ok "Заблокировано диапазонов: ${blocked_count}"
+        else
+            warn "Блокировок не настроено"
+        fi
+
+        # Статус rate limit
+        if iptables -L INPUT -n 2>/dev/null | grep -q "SCANNER_LIMIT"; then
+            ok "Rate limiting: активен"
+        fi
+
+        echo ""
+        sep
+        echo -e "  ${GREEN}1)${RESET} 🚫 Заблокировать известные диапазоны ГРФЦ ${YELLOW}(встроенный список)${RESET}"
+        echo -e "  ${GREEN}2)${RESET} ➕ Добавить свой IP / CIDR-диапазон"
+        echo -e "  ${GREEN}3)${RESET} ⚡ Rate limit новых подключений ${CYAN}(iptables)${RESET}"
+        echo -e "  ${GREEN}4)${RESET} 📋 Показать заблокированные диапазоны"
+        echo -e "  ${RED}5)${RESET} 🗑️  Снять все блокировки сканеров"
+        sep
+        echo -e "  ${YELLOW} 0)${RESET} ← Назад"
+        echo ""
+
+        read -rp "  Выбери пункт [0-5]: " sc_choice
+        echo ""
+
+        case "$sc_choice" in
+            1) _scanner_block_builtin  ;;
+            2) _scanner_add_custom     ;;
+            3) _scanner_ratelimit      ;;
+            4) _scanner_show           ;;
+            5) _scanner_remove_all     ;;
+            0) return ;;
+            *) warn "Неверный выбор." ;;
+        esac
+
+        echo ""
+        read -rp "  Нажми Enter для продолжения..." _
+    done
+}
+
+# --- Заблокировать встроенный список ГРФЦ ---
+_scanner_block_builtin() {
+    sep; echo -e "${BOLD}🚫 Блокировка известных диапазонов ГРФЦ${RESET}"; sep
+    echo ""
+    echo -e "  ${YELLOW}Список задокументирован community-проектами (не официальный от РКН).${RESET}"
+    echo -e "  ${YELLOW}Актуальность IP-диапазонов со временем может меняться.${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Будут заблокированы:${RESET}"
+    for entry in "${_SCANNER_BUILTIN[@]}"; do
+        local cidr comment
+        cidr=$(echo "$entry" | awk '{print $1}')
+        comment=$(echo "$entry" | sed 's/^[^ ]* *//')
+        echo -e "  ${RED}✗${RESET} ${cidr}  ${BLUE}${comment}${RESET}"
+    done
+    echo ""
+
+    read -rp "  Применить? [y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || { info "Отменено."; return; }
+
+    if ! command -v ufw &>/dev/null; then
+        warn "UFW не установлен! Установи его через пункт 8 главного меню."
+        return 1
+    fi
+
+    # Создаём/дополняем файл списка
+    touch "$_SCANNER_LIST"
+    local added=0
+    for entry in "${_SCANNER_BUILTIN[@]}"; do
+        local cidr; cidr=$(echo "$entry" | awk '{print $1}')
+        # Не дублируем если уже есть
+        if ! grep -q "^${cidr}" "$_SCANNER_LIST" 2>/dev/null; then
+            echo "$entry" >> "$_SCANNER_LIST"
+        fi
+        # Добавляем в UFW (insert 1 = высокий приоритет, до разрешающих правил)
+        if ! ufw status 2>/dev/null | grep -q "$cidr"; then
+            ufw insert 1 deny from "$cidr" to any >/dev/null 2>&1
+            (( added++ ))
+        fi
+    done
+
+    ok "Добавлено правил UFW: ${added} из ${#_SCANNER_BUILTIN[@]}"
+    info "Список сохранён: ${_SCANNER_LIST}"
+    echo ""
+    info "Для ручного добавления своих IP — используй пункт 2"
+    info "Актуальные базы: github.com/nicot/censorship-scanner-ips"
+}
+
+# --- Добавить свой диапазон ---
+_scanner_add_custom() {
+    echo ""
+    echo -e "  ${BOLD}➕ Добавить IP или CIDR-диапазон${RESET}"
+    echo -e "  ${BLUE}Примеры: 1.2.3.4  /  1.2.3.0/24  /  1.2.0.0/16${RESET}"
+    echo ""
+    read -rp "  Введи IP или CIDR: " cidr_input
+    [[ -z "$cidr_input" ]] && { info "Отменено."; return; }
+
+    # Простая проверка формата (цифры, точки, слэш)
+    if [[ ! "$cidr_input" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}(/[0-9]{1,2})?$ ]]; then
+        err "Неверный формат IP/CIDR: ${cidr_input}"; return 1
+    fi
+
+    read -rp "  Комментарий (необязательно): " user_comment
+
+    if ! command -v ufw &>/dev/null; then
+        warn "UFW не установлен!"; return 1
+    fi
+
+    touch "$_SCANNER_LIST"
+    if grep -q "^${cidr_input}" "$_SCANNER_LIST" 2>/dev/null; then
+        warn "${cidr_input} уже есть в списке"
+        return
+    fi
+
+    echo "${cidr_input}${user_comment:+    # ${user_comment}}" >> "$_SCANNER_LIST"
+    ufw insert 1 deny from "$cidr_input" to any >/dev/null 2>&1
+    ok "Добавлено и заблокировано: ${cidr_input}"
+}
+
+# --- Rate limiting через iptables ---
+_scanner_ratelimit() {
+    sep; echo -e "${BOLD}⚡ Ограничение частоты подключений к порту 443${RESET}"; sep
+    echo ""
+    echo -e "  ${CYAN}Как работает:${RESET}"
+    echo -e "  Iptables считает новые TCP-соединения к порту 443."
+    echo -e "  Если один IP делает слишком много подключений за короткое время — DROP."
+    echo -e "  Сканеры обычно делают десятки зондов подряд — они попадут под блок."
+    echo ""
+
+    # Текущие значения или дефолтные
+    local RL_LIMIT=15  # подключений
+    local RL_TIME=60   # за N секунд
+
+    if iptables -L INPUT -n 2>/dev/null | grep -q "SCANNER_LIMIT"; then
+        warn "Rate limiting уже активен!"
+        read -rp "  Перенастроить? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] || return
+        # Удаляем старые правила
+        iptables -D INPUT -p tcp --dport 443 -m state --state NEW \
+            -m hashlimit --hashlimit-above "${RL_LIMIT}/min" \
+            --hashlimit-burst "$RL_LIMIT" --hashlimit-mode srcip \
+            --hashlimit-name SCANNER_LIMIT -j DROP 2>/dev/null || true
+    fi
+
+    echo ""
+    read -rp "  Лимит подключений в минуту с одного IP [по умолчанию 15]: " val
+    [[ "$val" =~ ^[0-9]+$ ]] && RL_LIMIT=$val
+
+    echo ""
+    echo -e "  ${BOLD}Правило:${RESET} более ${RL_LIMIT} новых TCP-подключений/мин к :443 → DROP"
+    echo ""
+    read -rp "  Применить? [y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || { info "Отменено."; return; }
+
+    # Добавляем правило iptables (hashlimit)
+    iptables -I INPUT -p tcp --dport 443 -m state --state NEW \
+        -m hashlimit --hashlimit-above "${RL_LIMIT}/min" \
+        --hashlimit-burst "$RL_LIMIT" --hashlimit-mode srcip \
+        --hashlimit-name SCANNER_LIMIT -j DROP
+
+    # Делаем постоянным через iptables-persistent
+    if ! dpkg -l | grep -q iptables-persistent 2>/dev/null; then
+        info "Устанавливаем iptables-persistent для сохранения после перезагрузки..."
+        DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+    fi
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+
+    ok "Rate limiting активен: ${RL_LIMIT} подключений/мин с одного IP → DROP"
+    info "Правило сохранено и выживет после перезагрузки"
+}
+
+# --- Показать заблокированные диапазоны ---
+_scanner_show() {
+    sep; echo -e "${BOLD}📋 Заблокированные диапазоны сканеров${RESET}"; sep
+    echo ""
+    if [[ ! -f "$_SCANNER_LIST" ]] || [[ ! -s "$_SCANNER_LIST" ]]; then
+        warn "Список пуст. Используй пункт 1 или 2 для добавления."
+        return
+    fi
+    echo -e "  ${BOLD}Файл: ${_SCANNER_LIST}${RESET}"
+    echo ""
+    local n=1
+    while IFS= read -r line; do
+        [[ "$line" =~ ^# || -z "$line" ]] && continue
+        echo -e "  ${n}) ${RED}${line%%#*}${RESET}${BLUE}${line#*#}${RESET}" 2>/dev/null || \
+        echo -e "  ${n}) ${line}"
+        (( n++ ))
+    done < "$_SCANNER_LIST"
+    echo ""
+
+    # Статус rate limit
+    if iptables -L INPUT -n 2>/dev/null | grep -q "SCANNER_LIMIT"; then
+        echo -e "  ${GREEN}✓${RESET} Rate limiting активен"
+    else
+        echo -e "  ${YELLOW}○${RESET} Rate limiting не настроен"
+    fi
+}
+
+# --- Снять все блокировки сканеров ---
+_scanner_remove_all() {
+    echo ""
+    warn "Это снимет все UFW-блоки из списка и отключит rate limiting!"
+    read -rp "  Продолжить? [y/N]: " c
+    [[ "$c" =~ ^[Yy]$ ]] || { info "Отменено."; return; }
+
+    # Удаляем UFW-правила для каждого диапазона из списка
+    if [[ -f "$_SCANNER_LIST" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^# || -z "$line" ]] && continue
+            local cidr; cidr=$(echo "$line" | awk '{print $1}')
+            ufw delete deny from "$cidr" to any >/dev/null 2>&1 || true
+        done < "$_SCANNER_LIST"
+        rm -f "$_SCANNER_LIST"
+        ok "UFW-блоки сканеров удалены"
+    fi
+
+    # Удаляем rate limit
+    iptables -D INPUT -p tcp --dport 443 -m state --state NEW \
+        -m hashlimit --hashlimit-above "15/min" \
+        --hashlimit-burst 15 --hashlimit-mode srcip \
+        --hashlimit-name SCANNER_LIMIT -j DROP 2>/dev/null || true
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    ok "Rate limiting отключён"
+}
+
 # --- Главная функция подменю Fail2Ban ---
 fn_fail2ban() {
     while true; do
@@ -773,23 +1052,25 @@ fn_fail2ban() {
         echo -e "  ${GREEN}3)${RESET} 🔢 Попыток до бана      ${CYAN}(maxretry)${RESET}"
         echo -e "  ${GREEN}4)${RESET} 🔍 Окно поиска          ${CYAN}(findtime)${RESET}"
         echo -e "  ${GREEN}5)${RESET} 📊 Статус и заблокированные IP"
+        echo -e "  ${GREEN}7)${RESET} 🤖 Защита от сканеров   ${CYAN}(ГРФЦ / РКН)${RESET}"
         echo -e "  ${RED}6)${RESET} 🗑️  Удалить Fail2Ban"
         sep
         echo -e "  ${YELLOW} 0)${RESET} ← Назад в главное меню"
         echo ""
 
-        read -rp "  Выбери пункт [0-6]: " f2b_choice
+        read -rp "  Выбери пункт [0-7]: " f2b_choice
         echo ""
 
         case "$f2b_choice" in
-            1) _f2b_install    ;;
+            1) _f2b_install      ;;
             2) _f2b_set_bantime  ;;
             3) _f2b_set_maxretry ;;
             4) _f2b_set_findtime ;;
-            5) _f2b_status     ;;
-            6) _f2b_remove     ;;
-            0) return          ;;
-            *) warn "Неверный выбор '$f2b_choice'. Введи 0-6." ;;
+            5) _f2b_status       ;;
+            6) _f2b_remove       ;;
+            7) _f2b_scanner      ;;
+            0) return            ;;
+            *) warn "Неверный выбор '$f2b_choice'. Введи 0-7." ;;
         esac
 
         echo ""
