@@ -377,8 +377,10 @@ EOF
 
     cat > "${CADDY_DIR}/Caddyfile" <<EOF
 {
-    # Отключаем H3 в Caddy, чтобы освободить UDP-порт 443 для Hysteria2
-    auto_https disable_h3
+    # Отключаем HTTP/3, оставляя только h1 и h2 на TCP
+    servers {
+        protocols h1 h2
+    }
 }
 
 ${DOMAIN} {
