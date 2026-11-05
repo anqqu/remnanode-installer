@@ -14,7 +14,7 @@
 ## ⚡ Быстрый старт
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/anqqu/remnanode-installer/main/node-installer.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/anqqu/remnanode-installer/main/node-installer.sh -o /tmp/node-installer.sh && bash /tmp/node-installer.sh
 ```
 
 После первого запуска команда `rw-install` будет доступна из любого места:
