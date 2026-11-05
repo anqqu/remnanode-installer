@@ -5,12 +5,19 @@
 #  ОС: Debian 11/12, Ubuntu 22.04/24.04 LTS | Виртуализация: KVM
 # =============================================================================
 
+# Переходим в безопасную домашнюю папку (защита от getcwd: cannot access parent directories)
+cd /root 2>/dev/null || cd ~ 2>/dev/null || cd / 2>/dev/null
+
+# Автоудаление временного файла скрипта при выходе (если запущен через curl | bash)
+[[ "$0" == /tmp/rw-install-* ]] && trap 'rm -f "$0"' EXIT
+
 # ЗАЩИТА ОТ curl | bash: если stdin не терминал — скачиваем себя и перезапускаем
 if [[ ! -t 0 ]]; then
     _SELF_TMP=$(mktemp /tmp/rw-install-XXXXXX.sh)
     curl -fsSL "https://raw.githubusercontent.com/anqqu/remnanode-installer/main/node-installer.sh" \
          -o "$_SELF_TMP" 2>/dev/null || { echo "Ошибка загрузки"; exit 1; }
     chmod +x "$_SELF_TMP"
+    cat > /dev/null 2>&1  # Дочитываем пайп от первого curl, чтобы не было ошибки curl (23)
     exec bash "$_SELF_TMP" "$@" < /dev/tty
 fi
 
