@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-#  🌐 RemnaNode Installer v1.0
+#  🌐 RemnaNode Installer v1.3
 #  Автор: anqqu | https://github.com/anqqu/remnanode-installer
 #  ОС: Debian 11/12, Ubuntu 22.04/24.04 LTS | Виртуализация: KVM
 # =============================================================================
@@ -30,6 +30,7 @@ sep()  { echo -e "  ${CYAN}─────────────────�
 # =============================================================================
 REMNANODE_DIR="/opt/remnanode"   # директория ноды
 CERTBOT_DIR="/opt/certbot"       # директория certbot
+CADDY_DIR="/opt/caddy"           # директория caddy
 
 # =============================================================================
 # ПРОВЕРКИ
@@ -278,6 +279,182 @@ EOF
 }
 
 # =============================================================================
+# РЕЖИМ 3: НОДА + CADDY (XHTTP / САЙТ-ЗАГЛУШКА / АВТО-TLS)
+# =============================================================================
+fn_install_node_caddy() {
+    sep; echo -e "${BOLD}🌐 Установка RemnaNode + Caddy (XHTTP / Авто-TLS / Заглушка)${RESET}"; sep
+
+    # Шаг 1: Проверяем Docker
+    info "Шаг 1/7: Проверка Docker..."
+    check_docker
+
+    # Шаг 2: Создаём директории
+    info "Шаг 2/7: Создание директорий..."
+    mkdir -p "${REMNANODE_DIR}"
+    mkdir -p "${CADDY_DIR}/site"
+    ok "Директории готовы: ${REMNANODE_DIR} и ${CADDY_DIR}"
+
+    # Шаг 3: Параметры ноды из панели Remnawave
+    sep
+    info "Шаг 3/7: Введи данные из панели Remnawave"
+    echo ""
+    echo -e "  ${YELLOW}⚡ Эти данные берутся при создании ноды в панели Remnawave${RESET}"
+    echo ""
+
+    read -rp "  Введи NODE_PORT (порт из панели): " NODE_PORT
+    while [[ -z "$NODE_PORT" || ! "$NODE_PORT" =~ ^[0-9]+$ ]]; do
+        warn "Порт должен быть числом и не пустым!"
+        read -rp "  Введи NODE_PORT: " NODE_PORT
+    done
+
+    echo ""
+    read -rp "  Введи SECRET_KEY (секретный ключ из панели): " SECRET_KEY
+    while [[ -z "$SECRET_KEY" ]]; do
+        warn "Секретный ключ не может быть пустым!"
+        read -rp "  Введи SECRET_KEY: " SECRET_KEY
+    done
+
+    # Шаг 4: Настройки домена и XHTTP
+    sep
+    info "Шаг 4/7: Настройки домена и XHTTP"
+    echo ""
+    echo -e "  ${YELLOW}⚠️  A-запись домена должна указывать на IP этого сервера!${RESET}"
+    echo ""
+
+    read -rp "  Введи домен (например: node.example.com): " DOMAIN
+    while [[ -z "$DOMAIN" ]]; do
+        warn "Домен не может быть пустым!"
+        read -rp "  Введи домен: " DOMAIN
+    done
+
+    echo ""
+    read -rp "  Введи секретный путь XHTTP [/api/v1/telemetry]: " XHTTP_PATH
+    XHTTP_PATH="${XHTTP_PATH:-/api/v1/telemetry}"
+    [[ "$XHTTP_PATH" != /* ]] && XHTTP_PATH="/${XHTTP_PATH}"
+
+    echo ""
+    read -rp "  Введи внутренний порт для Xray [10085]: " XRAY_PORT
+    XRAY_PORT="${XRAY_PORT:-10085}"
+    while [[ ! "$XRAY_PORT" =~ ^[0-9]+$ ]]; do
+        warn "Порт должен быть числом!"
+        read -rp "  Введи внутренний порт для Xray [10085]: " XRAY_PORT
+        XRAY_PORT="${XRAY_PORT:-10085}"
+    done
+
+    # Шаг 5: Страница-заглушка и конфигурация Caddy
+    sep
+    info "Шаг 5/7: Создание страницы-заглушки и Caddyfile..."
+
+    cat > "${CADDY_DIR}/site/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Service Active</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #0f172a; color: #f8fafc; }
+        .card { text-align: center; padding: 2.5rem; border-radius: 14px; background: #1e293b; box-shadow: 0 10px 30px rgba(0,0,0,0.3); }
+        h1 { margin-bottom: 0.5rem; font-size: 1.8rem; }
+        p { color: #94a3b8; font-size: 1rem; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Service Status: Online</h1>
+        <p>Telemetry gateway and secure API endpoint.</p>
+    </div>
+</body>
+</html>
+EOF
+    ok "Страница-заглушка создана в ${CADDY_DIR}/site/index.html"
+
+    cat > "${CADDY_DIR}/Caddyfile" <<EOF
+{
+    # Отключаем H3 в Caddy, чтобы освободить UDP-порт 443 для Hysteria2
+    auto_https disable_h3
+}
+
+${DOMAIN} {
+    # Проксируем секретный путь в локальный Xray
+    reverse_proxy ${XHTTP_PATH}* 127.0.0.1:${XRAY_PORT}
+
+    # Все остальные запросы отдают сайт-заглушку
+    root * /srv/site
+    file_server
+}
+EOF
+    ok "Caddyfile создан в ${CADDY_DIR}/Caddyfile"
+
+    cat > "${CADDY_DIR}/docker-compose.yml" <<EOF
+services:
+  caddy:
+    image: caddy:latest
+    container_name: caddy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./site:/srv/site:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:
+EOF
+    ok "docker-compose.yml для Caddy создан"
+
+    # Шаг 6: docker-compose.yml ноды
+    info "Шаг 6/7: Создание docker-compose.yml для RemnaNode..."
+    cat > "${REMNANODE_DIR}/docker-compose.yml" <<EOF
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    network_mode: host
+    restart: always
+    cap_add:
+      - NET_ADMIN
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=${NODE_PORT}
+      - SECRET_KEY=${SECRET_KEY}
+EOF
+    ok "docker-compose.yml для RemnaNode создан"
+
+    # Шаг 7: Запуск Caddy и RemnaNode
+    sep
+    info "Шаг 7/7: Запуск Caddy и RemnaNode..."
+    cd "${CADDY_DIR}" && docker compose up -d
+    cd "${REMNANODE_DIR}" && docker compose up -d
+    ok "Caddy и RemnaNode успешно запущены!"
+    echo ""
+
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}🎉 Установка завершена! Настройка инбаунда в RemnaWave:${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}1. Параметры инбаунда на сервере (Inbound):${RESET}"
+    echo -e "     • Listen IP:       ${CYAN}127.0.0.1${RESET}"
+    echo -e "     • Port:            ${CYAN}${XRAY_PORT}${RESET}"
+    echo -e "     • Protocol:        ${CYAN}vless${RESET}"
+    echo -e "     • Transport:       ${CYAN}xhttp${RESET}"
+    echo -e "     • Path:            ${CYAN}${XHTTP_PATH}${RESET}"
+    echo -e "     • Security:        ${CYAN}none${RESET}"
+    echo ""
+    echo -e "  ${BOLD}2. Параметры для клиентов (Client / Subscription):${RESET}"
+    echo -e "     • External Port:   ${CYAN}443${RESET}"
+    echo -e "     • Host / SNI:      ${CYAN}${DOMAIN}${RESET}"
+    echo -e "     • Security:        ${CYAN}TLS${RESET}"
+    echo -e "     • ALPN:            ${CYAN}h2, http/1.1${RESET}"
+    echo -e "     • Fingerprint:     ${CYAN}chrome${RESET}"
+    echo -e "${GREEN}${BOLD}═══════════════════════════════════════════════════════════${RESET}"
+}
+
+# =============================================================================
 # ОБНОВЛЕНИЕ НОДЫ
 # =============================================================================
 fn_update_node() {
@@ -286,7 +463,7 @@ fn_update_node() {
     # Проверяем что нода вообще установлена
     if [[ ! -f "${REMNANODE_DIR}/docker-compose.yml" ]]; then
         err "Файл ${REMNANODE_DIR}/docker-compose.yml не найден!"
-        warn "Сначала установи ноду (пункт 1 или 2)"
+        warn "Сначала установи ноду (пункт 1, 2 или 3)"
         return 1
     fi
 
@@ -295,22 +472,41 @@ fn_update_node() {
     info "Перезапускаем ноду с новым образом..."
     docker compose -f "${REMNANODE_DIR}/docker-compose.yml" up -d
     ok "RemnaNode обновлена и перезапущена!"
+
+    if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+        info "Обновляем образ Caddy (caddy:latest)..."
+        docker compose -f "${CADDY_DIR}/docker-compose.yml" pull
+        docker compose -f "${CADDY_DIR}/docker-compose.yml" up -d
+        ok "Caddy обновлен и перезапущен!"
+    fi
 }
 
 # =============================================================================
 # ЛОГИ НОДЫ
 # =============================================================================
 fn_logs() {
-    sep; echo -e "${BOLD}📋 Логи RemnaNode${RESET}"; sep
+    sep; echo -e "${BOLD}📋 Просмотр логов${RESET}"; sep
 
-    if [[ ! -f "${REMNANODE_DIR}/docker-compose.yml" ]]; then
-        err "Файл ${REMNANODE_DIR}/docker-compose.yml не найден!"
-        warn "Сначала установи ноду (пункт 1 или 2)"
+    if [[ ! -f "${REMNANODE_DIR}/docker-compose.yml" && ! -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+        err "Контейнеры не найдены!"
+        warn "Сначала установи ноду (пункт 1, 2 или 3)"
         return 1
     fi
 
+    TARGET_COMPOSE="${REMNANODE_DIR}/docker-compose.yml"
+
+    if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+        echo -e "  ${BOLD}Выбери контейнер для логов:${RESET}"
+        echo -e "  ${GREEN}1)${RESET} RemnaNode ${GREEN}← по умолчанию${RESET}"
+        echo -e "  ${GREEN}2)${RESET} Caddy (веб-сервер / SSL)"
+        read -rp "  Выбери [1-2]: " log_c
+        if [[ "$log_c" == "2" ]]; then
+            TARGET_COMPOSE="${CADDY_DIR}/docker-compose.yml"
+        fi
+    fi
+
     info "Показываем логи (Ctrl+C для выхода в меню)..."
-    docker compose -f "${REMNANODE_DIR}/docker-compose.yml" logs -f -t
+    docker compose -f "$TARGET_COMPOSE" logs -f -t
 }
 
 # =============================================================================
@@ -329,6 +525,11 @@ fn_stop() {
 
     docker compose -f "${REMNANODE_DIR}/docker-compose.yml" down
     ok "RemnaNode остановлена"
+
+    if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+        docker compose -f "${CADDY_DIR}/docker-compose.yml" down 2>/dev/null || true
+        ok "Caddy остановлен"
+    fi
 }
 
 # =============================================================================
@@ -339,8 +540,13 @@ fn_start() {
 
     if [[ ! -f "${REMNANODE_DIR}/docker-compose.yml" ]]; then
         err "Файл ${REMNANODE_DIR}/docker-compose.yml не найден!"
-        warn "Сначала установи ноду (пункт 1 или 2)"
+        warn "Сначала установи ноду (пункт 1, 2 или 3)"
         return 1
+    fi
+
+    if [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+        docker compose -f "${CADDY_DIR}/docker-compose.yml" up -d
+        ok "Caddy запущен!"
     fi
 
     docker compose -f "${REMNANODE_DIR}/docker-compose.yml" up -d
@@ -1091,7 +1297,7 @@ fn_uninstall() {
     warn "Каждый компонент будет спрошен отдельно — ничего не удалится без подтверждения."
     echo ""
 
-    RM_NODE=false; RM_CERTBOT=false; RM_F2B=false
+    RM_NODE=false; RM_CERTBOT=false; RM_CADDY=false; RM_F2B=false
     RM_CRON=false; RM_UFW=false;    RM_ALIAS=false
 
     # --- 1. RemnaNode ---
@@ -1108,6 +1314,14 @@ fn_uninstall() {
         echo -e "  ${CYAN}[SSL]${RESET} Найден Certbot в ${CERTBOT_DIR}"
         read -rp "  Удалить сертификаты и директорию ${CERTBOT_DIR}? [y/N]: " c
         [[ "$c" =~ ^[Yy]$ ]] && RM_CERTBOT=true
+    fi
+
+    # --- 2.1 Caddy + сайт-заглушка ---
+    if [[ -d "${CADDY_DIR}" ]] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^caddy$"; then
+        echo ""
+        echo -e "  ${CYAN}[Caddy]${RESET} Найден Caddy в ${CADDY_DIR}"
+        read -rp "  Остановить контейнер и удалить ${CADDY_DIR} + сайт-заглушку? [y/N]: " c
+        [[ "$c" =~ ^[Yy]$ ]] && RM_CADDY=true
     fi
 
     # --- 3. Fail2Ban ---
@@ -1145,12 +1359,13 @@ fn_uninstall() {
     echo -e "  ${BOLD}Итоговый список действий:${RESET}"
     [[ "$RM_NODE"    == true ]] && echo -e "  ${RED}✗${RESET} Остановить и удалить RemnaNode (${REMNANODE_DIR})"
     [[ "$RM_CERTBOT" == true ]] && echo -e "  ${RED}✗${RESET} Удалить Certbot + сертификаты (${CERTBOT_DIR})"
+    [[ "$RM_CADDY"   == true ]] && echo -e "  ${RED}✗${RESET} Остановить и удалить Caddy + сайт-заглушку (${CADDY_DIR})"
     [[ "$RM_F2B"     == true ]] && echo -e "  ${RED}✗${RESET} Удалить Fail2Ban"
     [[ "$RM_CRON"    == true ]] && echo -e "  ${RED}✗${RESET} Удалить cron-задачу certbot"
     [[ "$RM_UFW"     == true ]] && echo -e "  ${RED}✗${RESET} Удалить правила UFW для 443"
     [[ "$RM_ALIAS"   == true ]] && echo -e "  ${RED}✗${RESET} Удалить команду rw-install"
 
-    if [[ "$RM_NODE$RM_CERTBOT$RM_F2B$RM_CRON$RM_UFW$RM_ALIAS" == *"true"* ]]; then
+    if [[ "$RM_NODE$RM_CERTBOT$RM_CADDY$RM_F2B$RM_CRON$RM_UFW$RM_ALIAS" == *"true"* ]]; then
         echo ""
         read -rp "  Всё верно? Запустить удаление? [y/N]: " final
         [[ "$final" =~ ^[Yy]$ ]] || { info "Отменено. Ничего не удалено."; return; }
@@ -1173,6 +1388,13 @@ fn_uninstall() {
         docker rm -f certbot 2>/dev/null || true
         rm -rf "${CERTBOT_DIR}"
         ok "Certbot и сертификаты удалены"
+    }
+    [[ "$RM_CADDY" == true ]] && {
+        info "Останавливаем и удаляем Caddy..."
+        docker compose -f "${CADDY_DIR}/docker-compose.yml" down -v 2>/dev/null || true
+        docker rm -f caddy 2>/dev/null || true
+        rm -rf "${CADDY_DIR}"
+        ok "Caddy и сайт-заглушка удалены"
     }
     [[ "$RM_F2B" == true ]] && {
         info "Удаляем Fail2Ban..."
@@ -1219,7 +1441,7 @@ main_menu() {
         clear
         echo ""
         echo -e "${CYAN}${BOLD}╔═══════════════════════════════════════════════╗${RESET}"
-        echo -e "${CYAN}${BOLD}║      🌐 RemnaNode Installer  v1.0             ║${RESET}"
+        echo -e "${CYAN}${BOLD}║      🌐 RemnaNode Installer  v1.3             ║${RESET}"
         echo -e "${CYAN}${BOLD}║   github.com/anqqu/remnanode-installer        ║${RESET}"
         echo -e "${CYAN}${BOLD}╚═══════════════════════════════════════════════╝${RESET}"
         echo ""
@@ -1231,6 +1453,13 @@ main_menu() {
             echo -e "  ${RED}● RemnaNode: остановлена${RESET}"
         else
             echo -e "  ${YELLOW}● RemnaNode: не установлена${RESET}"
+        fi
+
+        # Показываем статус Caddy если установлен
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^caddy$"; then
+            echo -e "  ${GREEN}● Caddy (HTTPS/XHTTP): запущен${RESET}"
+        elif [[ -f "${CADDY_DIR}/docker-compose.yml" ]]; then
+            echo -e "  ${RED}● Caddy (HTTPS/XHTTP): остановлен${RESET}"
         fi
 
         # Показываем домен если есть SSL-сертификат
@@ -1249,47 +1478,49 @@ main_menu() {
         echo -e "  ${BOLD}Установка:${RESET}"
         echo -e "  ${GREEN} 1)${RESET} 🐳 Установить ноду ${YELLOW}(без SSL)${RESET}"
         echo -e "  ${GREEN} 2)${RESET} 🔒 Установить ноду + SSL ${YELLOW}(Certbot / Hysteria / XTLS)${RESET}"
-        echo -e "  ${GREEN} 3)${RESET} 🔐 Добавить SSL к существующей ноде ${YELLOW}(апгрейд)${RESET}"
+        echo -e "  ${GREEN} 3)${RESET} 🌐 Установить ноду + Caddy ${YELLOW}(XHTTP / авто-TLS / сайт-заглушка)${RESET} ${GREEN}← новинка${RESET}"
+        echo -e "  ${GREEN} 4)${RESET} 🔐 Добавить SSL к существующей ноде ${YELLOW}(апгрейд)${RESET}"
         echo ""
         echo -e "  ${BOLD}Управление нодой:${RESET}"
-        echo -e "  ${GREEN} 4)${RESET} 🔄 Обновить RemnaNode ${YELLOW}(docker compose pull + up)${RESET}"
-        echo -e "  ${GREEN} 5)${RESET} 📋 Показать логи ноды"
-        echo -e "  ${GREEN} 6)${RESET} 🛑 Остановить ноду"
-        echo -e "  ${GREEN} 7)${RESET} ▶️  Запустить/Перезапустить ноду"
+        echo -e "  ${GREEN} 5)${RESET} 🔄 Обновить RemnaNode / Caddy"
+        echo -e "  ${GREEN} 6)${RESET} 📋 Показать логи (RemnaNode / Caddy)"
+        echo -e "  ${GREEN} 7)${RESET} 🛑 Остановить ноду и Caddy"
+        echo -e "  ${GREEN} 8)${RESET} ▶️  Запустить/Перезапустить ноду и Caddy"
         echo ""
         echo -e "  ${BOLD}Безопасность и защита:${RESET}"
-        echo -e "  ${GREEN} 8)${RESET} 🔥 Настроить UFW ${YELLOW}(фаервол: SSH + 443 + порт ноды)${RESET}"
-        echo -e "  ${GREEN} 9)${RESET} 🛡️  Fail2Ban ${YELLOW}(защита от брутфорса → подменю)${RESET}"
+        echo -e "  ${GREEN} 9)${RESET} 🔥 Настроить UFW ${YELLOW}(фаервол: SSH + 443 + порт ноды)${RESET}"
+        echo -e "  ${GREEN}10)${RESET} 🛡️  Fail2Ban ${YELLOW}(защита от брутфорса → подменю)${RESET}"
         echo ""
         echo -e "  ${BOLD}Утилиты:${RESET}"
-        echo -e "  ${GREEN}10)${RESET} 📥 Установить команду ${CYAN}rw-install${RESET} ${YELLOW}(запуск из любого места)${RESET}"
+        echo -e "  ${GREEN}11)${RESET} 📥 Установить команду ${CYAN}rw-install${RESET} ${YELLOW}(запуск из любого места)${RESET}"
         echo ""
         echo -e "  ${BOLD}Удаление:${RESET}"
-        echo -e "  ${RED}11)${RESET} 🗑️  Удалить скрипт и компоненты ${YELLOW}(с выбором что удалять)${RESET}"
+        echo -e "  ${RED}12)${RESET} 🗑️  Удалить скрипт и компоненты ${YELLOW}(с выбором что удалять)${RESET}"
         sep
         echo -e "  ${RED} 0)${RESET} ❌ Выход"
         echo ""
 
-        read -rp "  Выбери пункт [0-11]: " choice
+        read -rp "  Выбери пункт [0-12]: " choice
         echo ""
 
         case "$choice" in
-            1)  fn_install_node       ;;
-            2)  fn_install_node_ssl   ;;
-            3)  fn_upgrade_to_ssl     ;;
-            4)  fn_update_node        ;;
-            5)  fn_logs               ;;
-            6)  fn_stop               ;;
-            7)  fn_start              ;;
-            8)  fn_setup_ufw          ;;
-            9)  fn_fail2ban           ;;
-            10) fn_install_alias      ;;
-            11) fn_uninstall          ;;
+            1)  fn_install_node        ;;
+            2)  fn_install_node_ssl    ;;
+            3)  fn_install_node_caddy  ;;
+            4)  fn_upgrade_to_ssl      ;;
+            5)  fn_update_node         ;;
+            6)  fn_logs                ;;
+            7)  fn_stop                ;;
+            8)  fn_start               ;;
+            9)  fn_setup_ufw           ;;
+            10) fn_fail2ban            ;;
+            11) fn_install_alias       ;;
+            12) fn_uninstall           ;;
             0)
                 echo -e "${GREEN}Удачи! 👋${RESET}"
                 exit 0 ;;
             *)
-                warn "Неверный выбор: '$choice'. Введи 0-11." ;;
+                warn "Неверный выбор: '$choice'. Введи 0-12." ;;
         esac
 
         echo ""
